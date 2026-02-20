@@ -519,24 +519,53 @@
 const PROXY = 'https://script.google.com/macros/s/AKfycbyRXc68PYSmDSCYPakAS8Gc9R00kRjmsMYoDujPYMItyquXfwMAJUtRqXLiDlNWbSfDQQ/exec';
 let cfg = null;  // {instanceUrl, username, password}
 
+// Safe JSON parse — handles HTML error pages from proxy gracefully
+async function safeJson(res) {
+    const text = await res.text();
+    if (text.trim().startsWith('<')) {
+        // Proxy returned an HTML error page
+        throw new Error(`Proxy returned an HTML error page (HTTP ${res.status}). The request may not be supported.`);
+    }
+    try {
+        return JSON.parse(text);
+    } catch(e) {
+        throw new Error(`Invalid JSON from server: ${text.substring(0, 120)}`);
+    }
+}
+
 function proxyReq(url, opts = {}) {
     let p = `${PROXY}?url=${encodeURIComponent(url)}`;
     const auth = opts.auth || (cfg ? 'Basic ' + btoa(`${cfg.username}:${cfg.password}`) : '');
     if (auth) p += `&Authorization=${encodeURIComponent(auth)}`;
-    return fetch(p, { method: opts.method || 'GET', body: opts.body });
+    return fetch(p, { method: 'GET' });   // GET only — proxy doesn't support POST body
 }
 
 async function dhis2Get(path) {
     const res = await proxyReq(`${cfg.instanceUrl}${path}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${path}`);
-    return res.json();
+    if (!res.ok) {
+        const t = await res.text();
+        throw new Error(`HTTP ${res.status} – ${t.startsWith('<') ? 'Server error (HTML response)' : t.substring(0,100)}`);
+    }
+    return safeJson(res);
 }
 
+// POST via proxy: pass payload as URL param so the GAS proxy can forward it as a POST
 async function dhis2Post(path, body) {
-    const url = `${cfg.instanceUrl}${path}`;
+    const targetUrl = `${cfg.instanceUrl}${path}`;
     const auth = 'Basic ' + btoa(`${cfg.username}:${cfg.password}`);
-    const p = `${PROXY}?url=${encodeURIComponent(url)}&Authorization=${encodeURIComponent(auth)}`;
-    return fetch(p, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } });
+    const payload = JSON.stringify(body);
+
+    // GAS proxy pattern: method + payload passed as query params
+    // The proxy uses UrlFetchApp.fetch(url, {method, payload, headers})
+    const proxyUrl = `${PROXY}` +
+        `?url=${encodeURIComponent(targetUrl)}` +
+        `&Authorization=${encodeURIComponent(auth)}` +
+        `&method=POST` +
+        `&contentType=application%2Fjson` +
+        `&payload=${encodeURIComponent(payload)}`;
+
+    const res = await fetch(proxyUrl);
+    return safeJson(res);
 }
 
 // ══════════════════════════════════════════════
@@ -577,16 +606,23 @@ document.getElementById('loginForm').addEventListener('submit', async e => {
     try {
         const auth = 'Basic ' + btoa(`${username}:${password}`);
         const res = await proxyReq(`${instanceUrl}/api/me`, { auth });
-        if (res.ok) {
-            const user = await res.json();
+        const text = await res.text();
+        if (text.trim().startsWith('<')) {
+            notify(`Login failed — server returned an error page. Check URL & credentials.`, 'error');
+            btn.disabled = false; btn.textContent = '🔗 Connect to DHIS2';
+            return;
+        }
+        let user;
+        try { user = JSON.parse(text); } catch(e) { notify(`Unexpected response from server`, 'error'); btn.disabled = false; btn.textContent = '🔗 Connect to DHIS2'; return; }
+        if (res.ok && user.id) {
             cfg = { instanceUrl, username, password };
             document.getElementById('loginScreen').style.display = 'none';
             document.getElementById('mainContent').classList.add('active');
-            notify(`Connected! Welcome ${user.firstName || ''} ${user.surname || ''}`.trim(), 'success');
+            notify(`Connected! Welcome ${(user.firstName || '') + ' ' + (user.surname || '')}`.trim(), 'success');
             loadOuLevels();
             loadCOCs();
         } else {
-            notify(`Login failed (${res.status})`, 'error');
+            notify(`Login failed (${res.status}) — check credentials`, 'error');
         }
     } catch (err) {
         notify(`Connection error: ${err.message}`, 'error');
@@ -1020,15 +1056,17 @@ async function startUpload() {
         try {
             let qs = `importStrategy=${strategy}&dryRun=${dryRun}`;
             if (skipAudit) qs += '&skipAudit=true';
-            const res = await dhis2Post(`/api/dataValueSets?${qs}`, { dataValues: batch });
-            if (!res.ok) { log(`Batch ${b+1} HTTP error ${res.status}`, 'error'); errors += batch.length; continue; }
-            const data = await res.json();
+
+            // dhis2Post now returns parsed JSON (or throws on error/HTML)
+            const data = await dhis2Post(`/api/dataValueSets?${qs}`, { dataValues: batch });
+
             const ic = data.importCount || data.response?.importCount || {};
             imported += ic.imported || 0;
             updated += ic.updated || 0;
             ignored += ic.ignored || 0;
             const bErr = ic.ignored || 0;
             log(`Batch ${b+1}: ✓${ic.imported||0} imported · ↑${ic.updated||0} updated · ✗${ic.ignored||0} ignored`, bErr > 0 ? 'warning' : 'success');
+
             // Log conflicts
             const conflicts = data.conflicts || data.response?.conflicts || [];
             conflicts.slice(0, 2).forEach(c => log(`  ↳ ${c.value || JSON.stringify(c)}`, 'warning'));
