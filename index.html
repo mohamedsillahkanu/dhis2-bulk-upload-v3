@@ -514,9 +514,11 @@
 
 <script>
 // ══════════════════════════════════════════════
-// PROXY & CONFIG
+// PROXY URL (embedded in the backend of the HTML)
 // ══════════════════════════════════════════════
-const PROXY = 'https://script.google.com/macros/s/AKfycbyRXc68PYSmDSCYPakAS8Gc9R00kRjmsMYoDujPYMItyquXfwMAJUtRqXLiDlNWbSfDQQ/exec';
+const PROXY = 'https://script.google.com/macros/s/AKfycbzcaSDJTj1s0QDSMc3If4cn1tCay14HSmSh7QAy04i6hIfDORX8sednWEEj_O_DIhgG/exec';
+
+// Application state
 let cfg = null;  // {instanceUrl, username, password}
 
 // Safe JSON parse — handles HTML error pages from proxy gracefully
@@ -533,39 +535,38 @@ async function safeJson(res) {
     }
 }
 
-function proxyReq(url, opts = {}) {
+// Proxy GET request (with optional auth)
+async function proxyGet(url, auth) {
     let p = `${PROXY}?url=${encodeURIComponent(url)}`;
-    const auth = opts.auth || (cfg ? 'Basic ' + btoa(`${cfg.username}:${cfg.password}`) : '');
     if (auth) p += `&Authorization=${encodeURIComponent(auth)}`;
-    return fetch(p, { method: 'GET' });   // GET only — proxy doesn't support POST body
-}
-
-async function dhis2Get(path) {
-    const res = await proxyReq(`${cfg.instanceUrl}${path}`);
-    if (!res.ok) {
-        const t = await res.text();
-        throw new Error(`HTTP ${res.status} – ${t.startsWith('<') ? 'Server error (HTML response)' : t.substring(0,100)}`);
-    }
+    const res = await fetch(p);
     return safeJson(res);
 }
 
-// POST via proxy: pass payload as URL param so the GAS proxy can forward it as a POST
-async function dhis2Post(path, body) {
-    const targetUrl = `${cfg.instanceUrl}${path}`;
-    const auth = 'Basic ' + btoa(`${cfg.username}:${cfg.password}`);
-    const payload = JSON.stringify(body);
-
-    // GAS proxy pattern: method + payload passed as query params
-    // The proxy uses UrlFetchApp.fetch(url, {method, payload, headers})
-    const proxyUrl = `${PROXY}` +
-        `?url=${encodeURIComponent(targetUrl)}` +
+// Proxy POST request (payload is encoded and passed as query param)
+async function proxyPost(url, auth, body) {
+    let p = `${PROXY}` +
+        `?url=${encodeURIComponent(url)}` +
         `&Authorization=${encodeURIComponent(auth)}` +
         `&method=POST` +
         `&contentType=application%2Fjson` +
-        `&payload=${encodeURIComponent(payload)}`;
-
-    const res = await fetch(proxyUrl);
+        `&payload=${encodeURIComponent(JSON.stringify(body))}`;
+    const res = await fetch(p);
     return safeJson(res);
+}
+
+// DHIS2 GET (using current cfg)
+async function dhis2Get(path) {
+    if (!cfg) throw new Error('Not connected');
+    const auth = 'Basic ' + btoa(`${cfg.username}:${cfg.password}`);
+    return proxyGet(cfg.instanceUrl + path, auth);
+}
+
+// DHIS2 POST (using current cfg)
+async function dhis2Post(path, body) {
+    if (!cfg) throw new Error('Not connected');
+    const auth = 'Basic ' + btoa(`${cfg.username}:${cfg.password}`);
+    return proxyPost(cfg.instanceUrl + path, auth, body);
 }
 
 // ══════════════════════════════════════════════
@@ -605,16 +606,8 @@ document.getElementById('loginForm').addEventListener('submit', async e => {
     btn.disabled = true; btn.textContent = 'Connecting...';
     try {
         const auth = 'Basic ' + btoa(`${username}:${password}`);
-        const res = await proxyReq(`${instanceUrl}/api/me`, { auth });
-        const text = await res.text();
-        if (text.trim().startsWith('<')) {
-            notify(`Login failed — server returned an error page. Check URL & credentials.`, 'error');
-            btn.disabled = false; btn.textContent = '🔗 Connect to DHIS2';
-            return;
-        }
-        let user;
-        try { user = JSON.parse(text); } catch(e) { notify(`Unexpected response from server`, 'error'); btn.disabled = false; btn.textContent = '🔗 Connect to DHIS2'; return; }
-        if (res.ok && user.id) {
+        const user = await proxyGet(`${instanceUrl}/api/me`, auth);
+        if (user.id) {
             cfg = { instanceUrl, username, password };
             document.getElementById('loginScreen').style.display = 'none';
             document.getElementById('mainContent').classList.add('active');
@@ -622,7 +615,7 @@ document.getElementById('loginForm').addEventListener('submit', async e => {
             loadOuLevels();
             loadCOCs();
         } else {
-            notify(`Login failed (${res.status}) — check credentials`, 'error');
+            notify(`Login failed — unexpected response`, 'error');
         }
     } catch (err) {
         notify(`Connection error: ${err.message}`, 'error');
@@ -1057,7 +1050,6 @@ async function startUpload() {
             let qs = `importStrategy=${strategy}&dryRun=${dryRun}`;
             if (skipAudit) qs += '&skipAudit=true';
 
-            // dhis2Post now returns parsed JSON (or throws on error/HTML)
             const data = await dhis2Post(`/api/dataValueSets?${qs}`, { dataValues: batch });
 
             const ic = data.importCount || data.response?.importCount || {};
